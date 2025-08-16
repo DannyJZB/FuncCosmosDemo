@@ -40,4 +40,4 @@ jobs:
           app-name: 'FuncCosmosDemo'
           slot-name: 'Production'
           package: '${{ env.AZURE_FUNCTIONAPP_PACKAGE_PATH }}/output'
-          publish-profile: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE_241AFACCBF8446FD8EB6A4C4BACC178D }}
+          publish-profile: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE_7929A3768EBD478298AFF794EC5C36D1 }}
