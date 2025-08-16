@@ -1,108 +1,81 @@
-using Microsoft.Azure.Cosmos;
+using Azure.Storage.Blobs.Specialized;
 using Microsoft.Azure.Functions.Worker;
-using Microsoft.Azure.Functions.Worker.Http;
 using Microsoft.Extensions.Logging;
-using System.Net;
+using Microsoft.Azure.Cosmos;
 using System.Text.Json;
 
 namespace FuncCosmosDemo;
 
-public class CreateOrder
+public class BlobToCosmos
 {
     public record Order(
         string id,
         string customerId,
         decimal total,
         string[] items,
+        string blobName,
+        string container,
         DateTime createdUtc
     );
 
-    [Function("CreateOrder")]
-    public static async Task<HttpResponseData> Run(
-        [HttpTrigger(AuthorizationLevel.Anonymous, "post", Route = "orders")] HttpRequestData req, // Anonymous para probar local
+    [Function("BlobToCosmos")]
+    public static async Task Run(
+        // Se dispara cuando hay un blob nuevo en "uploads"
+        [BlobTrigger("uploads/{name}", Connection = "AzureWebJobsStorage")] Stream blobStream,
+        string name,
         FunctionContext ctx)
     {
-        var log = ctx.GetLogger("CreateOrder");
+        var log = ctx.GetLogger("BlobToCosmos");
+
+        // Leer metadatos del blob
+        var storageConn = Environment.GetEnvironmentVariable("AzureWebJobsStorage")
+            ?? throw new InvalidOperationException("Falta AzureWebJobsStorage");
+
+        // Usamos BlockBlobClient para leer metadata
+        var uriBase = new UriBuilder(new Uri($"https://dummy")).Uri; // no se usa, solo evita warnings
+        var client = new BlockBlobClient(storageConn, "uploads", name);
+        var props = await client.GetPropertiesAsync();
+        var meta = props.Value.Metadata;
+
+        // OBLIGATORIO: customerid y total en metadata
+        if (!meta.TryGetValue("customerid", out var customerId) || string.IsNullOrWhiteSpace(customerId))
+        {
+            log.LogWarning("Blob {name} sin metadata 'customerid'. Se omite.", name);
+            return;
+        }
+        if (!meta.TryGetValue("total", out var totalStr) || !decimal.TryParse(totalStr, out var total))
+        {
+            log.LogWarning("Blob {name} sin metadata 'total' válido. Se omite.", name);
+            return;
+        }
+        if (!meta.TryGetValue("items", out var items) || string.IsNullOrWhiteSpace(items))
+        {
+            log.LogWarning("Blob {items} sin metadata 'items' válido. Se omite.", items);
+            return;
+        }
+
+        string[]? itemsAray = JsonSerializer.Deserialize<string[]?>(items);
+        
+        var order = new Order(
+            id: Guid.NewGuid().ToString(),
+            customerId: customerId,
+            total: total,
+            itemsAray ?? [],
+            blobName: name,
+            container: "uploads",
+            createdUtc: DateTime.UtcNow
+        );
+
+        // Insertar en Cosmos
+        var cosmosCs = Environment.GetEnvironmentVariable("CosmosConnectionString")
+            ?? throw new InvalidOperationException("Falta CosmosConnectionString");
         var dbName = Environment.GetEnvironmentVariable("CosmosDatabase") ?? "appdb";
-        var cont = Environment.GetEnvironmentVariable("CosmosContainer") ?? "orders";
+        var contName = Environment.GetEnvironmentVariable("CosmosContainer") ?? "orders";
 
-        // --- Body ---
-        var body = await new StreamReader(req.Body).ReadToEndAsync();
-        if (string.IsNullOrWhiteSpace(body))
-            return await Bad(req, "Empty body");
+        using var cosmos = new CosmosClient(cosmosCs);
+        var container = cosmos.GetContainer(dbName, contName);
+        await container.CreateItemAsync(order, new PartitionKey(order.customerId));
 
-        Order order;
-        try
-        {
-            using var doc = JsonDocument.Parse(body);
-            var root = doc.RootElement;
-
-            var id = root.TryGetProperty("id", out var _id) && _id.ValueKind == JsonValueKind.String
-                ? _id.GetString()!
-                : Guid.NewGuid().ToString();
-
-            var customerId = root.GetProperty("customerId").GetString()!;
-            var total = Convert.ToDecimal(root.GetProperty("total").GetString());
-
-            var items = JsonSerializer.Deserialize<string[]?>(root.GetProperty("items").GetString());
-
-            order = new Order(id, customerId, total, items, DateTime.UtcNow);
-        }
-        catch (Exception ex)
-        {
-            return await Bad(req, $"Invalid JSON: {ex.Message}");
-        }
-
-        // --- Cosmos client (sin Lazy, con validación y catch general) ---
-        var cs = Environment.GetEnvironmentVariable("CosmosConnectionString");
-        if (string.IsNullOrWhiteSpace(cs))
-            return await Fail(req, "CosmosConnectionString is missing. Define it in local.settings.json (Values) o en App Settings.");
-
-        CosmosClient client;
-        try
-        {
-            client = new CosmosClient(cs);
-        }
-        catch (Exception ex)
-        {
-            log.LogError(ex, "Error creating CosmosClient. Check Connection String format (debe empezar con 'AccountEndpoint=' y tener 'AccountKey=').");
-            return await Fail(req, $"Cannot create CosmosClient: {ex.Message}");
-        }
-
-        try
-        {
-            var container = client.GetContainer(dbName, cont);
-            await container.CreateItemAsync(order, new PartitionKey(order.customerId));
-        }
-        catch (CosmosException cex)
-        {
-            log.LogError(cex, "Cosmos error {Status} - {Message}", cex.StatusCode, cex.Message);
-            var r = req.CreateResponse(HttpStatusCode.BadRequest);
-            await r.WriteStringAsync($"Cosmos error {cex.StatusCode}: {cex.Message}");
-            return r;
-        }
-        catch (Exception ex)
-        {
-            log.LogError(ex, "Unexpected error writing to Cosmos");
-            return await Fail(req, $"Unexpected error: {ex.Message}");
-        }
-
-        var ok = req.CreateResponse(HttpStatusCode.Created);
-        await ok.WriteAsJsonAsync(order);
-        return ok;
-    }
-
-    private static async Task<HttpResponseData> Bad(HttpRequestData req, string msg)
-    {
-        var r = req.CreateResponse(HttpStatusCode.BadRequest);
-        await r.WriteStringAsync(msg);
-        return r;
-    }
-
-    private static async Task<HttpResponseData> Fail(HttpRequestData req, string msg)
-    {
-        var r = req.CreateResponse(HttpStatusCode.InternalServerError);
-        await r.WriteStringAsync(msg);
-        return r;
+        log.LogInformation("Insertado en Cosmos: {id} desde blob {blob}", order.id, name);
     }
 }
